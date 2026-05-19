@@ -5,6 +5,8 @@
 **By:** Jainil Rana, Mansi Gupta, Mohit Manoj Barade  
 **Course:** CMPE-257 Machine Learning | San Jose State University | Spring 2026
 
+**Live Application Dashboard:** [https://alzheimer-detection-xi.vercel.app](https://alzheimer-detection-xi.vercel.app)
+
 ---
 
 ## 📌 Problem Description & Motivation
