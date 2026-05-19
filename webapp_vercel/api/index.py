@@ -1,15 +1,16 @@
 """
 Alzheimer's Disease Detection - FastAPI Backend
 Serves feature extraction and XGBoost inference for the Phase 2 pipeline.
+(Lightweight Vercel version: Pandas and scikit-learn removed)
 """
 
 import json
 import logging
 from pathlib import Path
+import csv
 
-import joblib
 import numpy as np
-import pandas as pd
+import xgboost as xgb
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 # Hardcoded config — paths relative to api directory
 # ---------------------------------------------------------------------------
 API_ROOT = Path(__file__).parent
-ENHANCED_CSV   = API_ROOT / "data" / "oasis1_full_enhanced_features.csv"
+DATA_JSON = API_ROOT / "data" / "patient_data.json"
 DEFAULT_SESSION = "OAS1_0003_MR1"
 
 # Full-feature mode
@@ -34,9 +35,6 @@ MODES = {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Load shared data once at startup
-# ---------------------------------------------------------------------------
 app = FastAPI(title="Alzheimer Detection API", version="1.0")
 
 app.add_middleware(
@@ -46,245 +44,250 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class _ArtifactCache:
-    df: pd.DataFrame | None = None
-    scaler: object | None = None
-    feature_names_full: list | None = None
+    patients: list = []
+    scaler: dict = {}
     model_cache: dict = {}
     feature_importance_cache: dict = {}
-
+    scaler_p1: dict = {}
 
 _cache = _ArtifactCache()
 
-
 @app.on_event("startup")
 def startup():
-    logger.info("Loading OASIS-1 enhanced feature CSV …")
-    _cache.df = pd.read_csv(ENHANCED_CSV)
-    logger.info(f"  → {len(_cache.df)} sessions, {len(_cache.df.columns)} columns")
+    logger.info("Loading OASIS-1 patient data JSON …")
+    if DATA_JSON.exists():
+        with open(DATA_JSON, "r") as f:
+            _cache.patients = json.load(f)
+        logger.info(f"  → {len(_cache.patients)} sessions loaded.")
+    else:
+        logger.warning(f"Patient data JSON not found at {DATA_JSON}")
 
-    # Load the full-mode scaler (used as the base for all modes)
-    data_dir = MODES["full"]["data_dir"]
-    _cache.scaler = joblib.load(data_dir / "scaler.pkl")
-    _cache.feature_names_full = joblib.load(data_dir / "feature_names.pkl")
-    logger.info(f"  → {len(_cache.feature_names_full)} features in full mode")
-
-    # Load all XGBoost models and their feature importances
+    # Load full mode scaler (Phase 2)
+    scaler_path = MODES["full"]["data_dir"] / "scaler.json"
+    if scaler_path.exists():
+        with open(scaler_path, "r") as f:
+            _cache.scaler = json.load(f)
+    
+    # Load models
     for mode_key, mode_cfg in MODES.items():
-        model_path = mode_cfg["models_dir"] / "xgboost_model.pkl"
+        model_path = mode_cfg["models_dir"] / "xgboost_model.json"
         if model_path.exists():
-            _cache.model_cache[mode_key] = joblib.load(model_path)
+            booster = xgb.Booster()
+            booster.load_model(str(model_path))
+            _cache.model_cache[mode_key] = booster
             logger.info(f"  → Loaded XGBoost [{mode_key}] from {model_path}")
-        else:
-            logger.warning(f"  ! XGBoost model not found for mode '{mode_key}' at {model_path}")
-
+            
         fi_path = mode_cfg["models_dir"] / "xgboost_feature_importance.csv"
         if fi_path.exists():
-            _cache.feature_importance_cache[mode_key] = pd.read_csv(fi_path).to_dict(orient="records")
+            fi_list = []
+            with open(fi_path, "r") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # convert numeric values
+                    for k,v in row.items():
+                        try:
+                            row[k] = float(v)
+                        except:
+                            pass
+                    fi_list.append(row)
+            _cache.feature_importance_cache[mode_key] = fi_list
 
     # Load Phase 1 Model
-    phase1_model_path = API_ROOT / "data" / "phase1" / "xgboost_model.pkl"
+    phase1_model_path = API_ROOT / "data" / "phase1" / "xgboost_model.json"
     if phase1_model_path.exists():
-        _cache.model_cache["phase1"] = joblib.load(phase1_model_path)
+        booster_p1 = xgb.Booster()
+        booster_p1.load_model(str(phase1_model_path))
+        _cache.model_cache["phase1"] = booster_p1
         logger.info(f"  → Loaded Phase 1 XGBoost from {phase1_model_path}")
-    
+
     phase1_fi_path = API_ROOT / "data" / "phase1" / "xgboost_feature_importance.csv"
     if phase1_fi_path.exists():
-        _cache.feature_importance_cache["phase1"] = pd.read_csv(phase1_fi_path).to_dict(orient="records")
+        fi_list = []
+        with open(phase1_fi_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                for k,v in row.items():
+                    try:
+                        row[k] = float(v)
+                    except:
+                        pass
+                fi_list.append(row)
+        _cache.feature_importance_cache["phase1"] = fi_list
 
-    phase1_scaler_path = API_ROOT / "data" / "processed" / "scaler.pkl"
+    phase1_scaler_path = API_ROOT / "data" / "processed" / "scaler.json"
     if phase1_scaler_path.exists():
-        _cache.scaler_p1 = joblib.load(phase1_scaler_path)
+        with open(phase1_scaler_path, "r") as f:
+            _cache.scaler_p1 = json.load(f)
 
     logger.info("Startup complete.")
 
-
-# ---------------------------------------------------------------------------
-# Helper: preprocess one patient row for inference
-# ---------------------------------------------------------------------------
-
-def _preprocess_row(raw_row: pd.Series, mode_key: str) -> pd.DataFrame:
-    """
-    Apply the same preprocessing the training pipeline used:
-      1. Encode M/F categorical column
-      2. Align to the scaler's full feature set, scale
-      3. Drop ablation-excluded columns after scaling
-      4. Re-align column order to match the model's exact feature_names_in_
-         (prevents feature-order mismatch between scaler and ablation models)
-    """
-    row = raw_row.copy().to_frame().T.reset_index(drop=True)
-
-    # Encode M/F  (F→0, M→1) same as LabelEncoder trained on ['F','M'])
-    if "M/F" in row.columns:
-        row["M/F"] = row["M/F"].map({"F": 0, "M": 1, "f": 0, "m": 1}).fillna(0)
-
-    # -- Step 1: build a full feature vector in scaler's expected column order --
-    if hasattr(_cache.scaler, "feature_names_in_"):
-        scaler_cols = list(_cache.scaler.feature_names_in_)
-    else:
-        # Fallback: use full feature names minus Subject_ID
-        scaler_cols = [f for f in _cache.feature_names_full if f != "Subject_ID"]
-
-    X_full = pd.DataFrame(0.0, index=[0], columns=scaler_cols)
-    for col in scaler_cols:
-        if col in row.columns:
-            val = row[col].values[0]
+def _preprocess_row(row_dict: dict, mode_key: str) -> tuple:
+    """Manual preprocessing without pandas/sklearn"""
+    row = dict(row_dict)
+    
+    # Encode M/F
+    mf = row.get("M/F")
+    if mf in ["F", "f"]: row["M/F"] = 0.0
+    elif mf in ["M", "m"]: row["M/F"] = 1.0
+    else: row["M/F"] = 0.0
+    
+    # 1. Build full feature vector
+    scaler_cols = _cache.scaler.get("feature_names_in_", [])
+    if not scaler_cols:
+        raise Exception("Missing feature names in scaler.json")
+        
+    X_full = np.zeros(len(scaler_cols))
+    for i, col in enumerate(scaler_cols):
+        val = row.get(col)
+        if val is not None:
             try:
-                # Convert to float, replacing NaN with 0.0
-                float_val = float(val)
-                X_full[col] = float_val if not np.isnan(float_val) else 0.0
-            except (ValueError, TypeError):
-                X_full[col] = 0.0
+                X_full[i] = float(val)
+            except:
+                X_full[i] = 0.0
 
-    # -- Step 2: scale the full vector --
-    X_scaled_full = _cache.scaler.transform(X_full)
-    X_scaled_df = pd.DataFrame(X_scaled_full, columns=scaler_cols)
-
-    # -- Step 3: drop columns excluded by this ablation mode --
+    # 2. Scale full vector
+    mean_ = np.array(_cache.scaler["mean_"])
+    scale_ = np.array(_cache.scaler["scale_"])
+    # prevent div by zero just in case
+    scale_ = np.where(scale_ == 0, 1.0, scale_)
+    X_scaled_full = (X_full - mean_) / scale_
+    
+    # 3. Drop columns for ablation (if any)
     drop_cols = set(MODES[mode_key]["drop_cols"])
-    features_after_drop = [c for c in scaler_cols if c not in drop_cols]
-    X = X_scaled_df[features_after_drop].copy()
-
-    # -- Step 4: re-align to the model's exact feature order (authoritative) --
-    model = _cache.model_cache.get(mode_key)
-    if model is not None and hasattr(model, "feature_names_in_"):
-        model_feature_names = [str(f) for f in model.feature_names_in_]
-        # Only keep features the model knows about, in its exact order
-        X = X[[c for c in model_feature_names if c in X.columns]]
-        features_after_drop = list(X.columns)
-
-    return X, features_after_drop
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+    
+    # 4. Re-align (for full mode, it's just the same)
+    # The XGBoost booster expects DMatrix. We need feature names.
+    booster = _cache.model_cache.get(mode_key)
+    model_feature_names = booster.feature_names if booster else scaler_cols
+    
+    X_final = []
+    features_after_drop = []
+    
+    for feat in model_feature_names:
+        if feat in drop_cols:
+            continue
+        try:
+            idx = scaler_cols.index(feat)
+            X_final.append(X_scaled_full[idx])
+            features_after_drop.append(feat)
+        except ValueError:
+            pass
+            
+    X = np.array([X_final])
+    dmatrix = xgb.DMatrix(X, feature_names=features_after_drop)
+    return dmatrix, features_after_drop
 
 @app.get("/")
 def read_root():
-    return {"message": "NeuroScan AI Backend is running. Please access the web interface at http://localhost:8080"}
+    return {"message": "NeuroScan AI Backend is running. Please access the web interface."}
 
 @app.get("/patient-info")
 def patient_info(session_id: str = DEFAULT_SESSION):
-    """Return the hardcoded patient's raw clinical data row."""
-    df = _cache.df
-    row = df[df["ID"] == session_id]
-    if row.empty:
-        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found in CSV")
+    row = next((r for r in _cache.patients if r.get("ID") == session_id), None)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found in JSON")
 
-    r = row.iloc[0]
     clinical = {
         "session_id": session_id,
-        "age": _safe_val(r, "Age"),
-        "sex": _safe_val(r, "M/F"),
-        "education": _safe_val(r, "Educ"),
-        "ses": _safe_val(r, "SES"),
-        "mmse": _safe_val(r, "MMSE"),
-        "etiv": _safe_val(r, "eTIV"),
-        "nwbv": _safe_val(r, "nWBV"),
-        "asf": _safe_val(r, "ASF"),
-        "cdr": _safe_val(r, "CDR"),
-        "ground_truth": int(r["CDR"] > 0) if pd.notna(r.get("CDR")) else None,
-        "ground_truth_label": "Demented" if (pd.notna(r.get("CDR")) and r["CDR"] > 0) else "Non-Demented",
+        "age": _safe_val(row, "Age"),
+        "sex": _safe_val(row, "M/F"),
+        "education": _safe_val(row, "Educ"),
+        "ses": _safe_val(row, "SES"),
+        "mmse": _safe_val(row, "MMSE"),
+        "etiv": _safe_val(row, "eTIV"),
+        "nwbv": _safe_val(row, "nWBV"),
+        "asf": _safe_val(row, "ASF"),
+        "cdr": _safe_val(row, "CDR"),
+        "ground_truth": 1 if (row.get("CDR") is not None and float(row["CDR"]) > 0) else 0,
+        "ground_truth_label": "Demented" if (row.get("CDR") is not None and float(row["CDR"]) > 0) else "Non-Demented",
     }
     return clinical
 
-
 @app.get("/modes")
 def get_modes():
-    """Return available ablation modes."""
     return [{"key": k, "label": v["label"]} for k, v in MODES.items()]
-
 
 @app.post("/predict/{mode_key}")
 def predict(mode_key: str, response: Response, session_id: str = DEFAULT_SESSION):
-    # Prevent browser/proxy from caching inference results
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     response.headers["Pragma"] = "no-cache"
-    """Run XGBoost inference for the patient."""
+    
     if mode_key not in MODES:
-        raise HTTPException(status_code=400, detail=f"Unknown mode '{mode_key}'. Use: {list(MODES.keys())}")
+        raise HTTPException(status_code=400, detail=f"Unknown mode '{mode_key}'")
     if mode_key not in _cache.model_cache:
         raise HTTPException(status_code=503, detail=f"Model for mode '{mode_key}' not loaded.")
 
-    df = _cache.df
-    row = df[df["ID"] == session_id]
-    if row.empty:
+    raw_row = next((r for r in _cache.patients if r.get("ID") == session_id), None)
+    if not raw_row:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
 
-    raw_row = row.iloc[0]
-    X, feature_names_used = _preprocess_row(raw_row, mode_key)
-    model = _cache.model_cache[mode_key]
+    dmatrix, feature_names_used = _preprocess_row(raw_row, mode_key)
+    booster = _cache.model_cache[mode_key]
 
     try:
-        proba = model.predict_proba(X)[0]
-        pred = int(np.argmax(proba))
-        confidence = float(proba[pred])
-        prob_demented = float(proba[1]) if len(proba) > 1 else float(proba[0])
+        # XGBoost Booster predict returns probabilities for binary classification by default
+        proba_val = booster.predict(dmatrix)[0]
+        prob_demented = float(proba_val)
+        prob_non_demented = 1.0 - prob_demented
+        pred = 1 if prob_demented >= 0.5 else 0
+        confidence = prob_demented if pred == 1 else prob_non_demented
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {e}")
 
-    # Build feature values dict (unscaled raw values for display)
     raw_vals = {}
     for feat in feature_names_used:
         val = raw_row.get(feat)
-        if val is None or (isinstance(val, float) and np.isnan(val)):
+        if val is None:
             raw_vals[feat] = None
         elif isinstance(val, str):
-            # For categorical like M/F, show the original string
             raw_vals[feat] = val
         else:
             try:
                 raw_vals[feat] = round(float(val), 4)
-            except (TypeError, ValueError):
+            except:
                 raw_vals[feat] = str(val)
 
-    # Feature importance for this mode
     fi = _cache.feature_importance_cache.get(mode_key, [])
 
-    # Run Phase 1 Model for comparison if available
+    # Phase 1 Model
     phase1_results = {}
-    if "phase1" in _cache.model_cache and getattr(_cache, "scaler_p1", None):
-        model_p1 = _cache.model_cache["phase1"]
-        scaler_p1 = _cache.scaler_p1
+    if "phase1" in _cache.model_cache and _cache.scaler_p1:
+        booster_p1 = _cache.model_cache["phase1"]
+        mean_p1 = np.array(_cache.scaler_p1["mean_"])
+        scale_p1 = np.array(_cache.scaler_p1["scale_"])
+        scale_p1 = np.where(scale_p1 == 0, 1.0, scale_p1)
         
-        # Scale continuous features using Phase 1 scaler
-        scaler_cols = ['Age', 'Educ', 'SES', 'MMSE', 'eTIV', 'nWBV', 'ASF', 'Delay']
-        X_scale = pd.DataFrame(0.0, index=[0], columns=scaler_cols)
-        for c in scaler_cols:
-            val = raw_row.get(c)
-            try:
-                fval = float(val)
-                X_scale[c] = fval if not np.isnan(fval) else 0.0
-            except (ValueError, TypeError):
-                X_scale[c] = 0.0
-                
-        X_scaled_arr = scaler_p1.transform(X_scale)
-        X_scaled_df = pd.DataFrame(X_scaled_arr, columns=scaler_cols)
+        scaler_cols_p1 = ['Age', 'Educ', 'SES', 'MMSE', 'eTIV', 'nWBV', 'ASF', 'Delay']
+        X_scale = np.zeros(len(scaler_cols_p1))
+        for i, c in enumerate(scaler_cols_p1):
+            v = raw_row.get(c)
+            X_scale[i] = float(v) if v is not None else 0.0
+            
+        X_scaled_arr = (X_scale - mean_p1) / scale_p1
+        X_scaled_dict = {c: X_scaled_arr[i] for i,c in enumerate(scaler_cols_p1)}
         
-        # Construct final Phase 1 features: ['M/F', 'Age', 'Educ', 'SES', 'MMSE', 'eTIV', 'nWBV', 'ASF']
         p1_feats = ['M/F', 'Age', 'Educ', 'SES', 'MMSE', 'eTIV', 'nWBV', 'ASF']
-        X_p1 = pd.DataFrame(0.0, index=[0], columns=p1_feats)
-        for c in p1_feats:
+        X_p1 = np.zeros(len(p1_feats))
+        for i, c in enumerate(p1_feats):
             if c == 'M/F':
-                val = raw_row.get(c)
-                if pd.isna(val): X_p1[c] = 0.0
-                else: X_p1[c] = 1.0 if str(val).upper() == 'M' else 0.0
+                v = raw_row.get(c)
+                if str(v).upper() in ['M', '1', '1.0']: X_p1[i] = 1.0
+                else: X_p1[i] = 0.0
             else:
-                X_p1[c] = X_scaled_df[c]
-        
+                X_p1[i] = X_scaled_dict[c]
+                
+        dmat_p1 = xgb.DMatrix(np.array([X_p1]), feature_names=p1_feats)
         try:
-            proba_p1 = model_p1.predict_proba(X_p1)[0]
-            pred_p1 = int(np.argmax(proba_p1))
-            prob_demented_p1 = float(proba_p1[1]) if len(proba_p1) > 1 else float(proba_p1[0])
-            prob_non_demented_p1 = float(proba_p1[0]) if len(proba_p1) > 1 else 1 - float(proba_p1[0])
+            prob_p1 = float(booster_p1.predict(dmat_p1)[0])
+            pred_p1 = 1 if prob_p1 >= 0.5 else 0
+            
             fi_p1 = _cache.feature_importance_cache.get("phase1", [])
             phase1_results = {
                 "prediction": pred_p1,
                 "prediction_label": "Demented" if pred_p1 == 1 else "Non-Demented",
-                "prob_demented": prob_demented_p1,
-                "prob_non_demented": prob_non_demented_p1,
+                "prob_demented": prob_p1,
+                "prob_non_demented": 1.0 - prob_p1,
                 "feature_importance": fi_p1[:5]
             }
         except Exception as e:
@@ -298,25 +301,23 @@ def predict(mode_key: str, response: Response, session_id: str = DEFAULT_SESSION
         "prediction_label": "Demented" if pred == 1 else "Non-Demented",
         "confidence": confidence,
         "prob_demented": prob_demented,
-        "prob_non_demented": float(proba[0]) if len(proba) > 1 else 1 - float(proba[0]),
+        "prob_non_demented": prob_non_demented,
         "num_features_used": len(feature_names_used),
         "features": raw_vals,
-        "feature_importance": fi[:15],   # top 15
-        "phase1_results": phase1_results, # added for comparison
+        "feature_importance": fi[:15],
+        "phase1_results": phase1_results,
     }
-
 
 def _safe_val(row, col):
     val = row.get(col)
-    if val is None or (isinstance(val, float) and np.isnan(val)):
+    if val is None:
         return None
-    if isinstance(val, (np.integer,)):
+    if isinstance(val, float) and val.is_integer():
         return int(val)
-    if isinstance(val, (np.floating,)):
-        return round(float(val), 4)
+    if isinstance(val, float):
+        return round(val, 4)
     return val
-
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("index:app", host="0.0.0.0", port=8000, reload=True)
