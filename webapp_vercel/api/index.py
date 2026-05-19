@@ -155,11 +155,12 @@ def _preprocess_row(row_dict: dict, mode_key: str) -> tuple:
             
     return X_final, features_after_drop
 
-@app.get("/")
+@app.get("/api")
+@app.get("/api/")
 def read_root():
     return {"message": "NeuroScan AI Backend is running. Please access the web interface."}
 
-@app.get("/patient-info")
+@app.get("/api/patient-info")
 def patient_info(session_id: str = DEFAULT_SESSION):
     row = next((r for r in _cache.patients if r.get("ID") == session_id), None)
     if not row:
@@ -181,11 +182,11 @@ def patient_info(session_id: str = DEFAULT_SESSION):
     }
     return clinical
 
-@app.get("/modes")
+@app.get("/api/modes")
 def get_modes():
     return [{"key": k, "label": v["label"]} for k, v in MODES.items()]
 
-@app.post("/predict/{mode_key}")
+@app.post("/api/predict/{mode_key}")
 def predict(mode_key: str, response: Response, session_id: str = DEFAULT_SESSION):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     response.headers["Pragma"] = "no-cache"
